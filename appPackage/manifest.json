@@ -1,0 +1,53 @@
+{
+    "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
+    "manifestVersion": "1.21",
+    "version": "1.0.2",
+    "id": "${{TEAMS_APP_ID}}",
+    "developer": {
+        "name": "Near Partner.",
+        "websiteUrl": "https://www.nearpartner.com",
+        "privacyUrl": "https://www.nearpartner.com/privacy",
+        "termsOfUseUrl": "https://www.nearpartner.com/termofuse"
+    },
+    "icons": {
+        "color": "color.png",
+        "outline": "outline.png"
+    },
+    "name": {
+        "short": "Near Partner Bot",
+        "full": "Near Partner AI Assistant"
+    },
+    "description": {
+        "short": "Near Partner AI Assistant",
+        "full": "Near Partner AI Assistant with access to MCP servers"
+    },
+    "accentColor": "#FFFFFF",
+    "bots": [
+        {
+            "botId": "${{BOT_ID}}",
+            "scopes": [
+                "personal",
+                "team",
+                "groupChat"
+            ],
+            "supportsFiles": false,
+            "isNotificationOnly": false,
+            "commandLists": [
+                {
+                  "scopes": ["personal", "team", "groupChat"],
+                  "commands": [
+                      
+                  ]
+                }
+            ]
+        }
+    ],
+    "composeExtensions": [],
+    "configurableTabs": [],
+    "staticTabs": [],
+    "permissions": [
+        "identity",
+        "messageTeamMembers"
+    ],
+    "validDomains": []
+}
