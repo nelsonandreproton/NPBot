@@ -1,5 +1,24 @@
 // index.js is used to setup and configure your bot
 
+// Load environment variables first
+require('dotenv').config();
+
+// Validate critical environment variables before starting
+const requiredEnvVars = ['BOT_ID', 'BOT_PASSWORD'];
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName] || process.env[varName].trim() === '');
+
+if (missingEnvVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingEnvVars.join(', ')}`);
+  console.error('Please check your .env file or Azure App Service configuration.');
+  console.error('\nRequired variables:');
+  console.error('BOT_ID=your-azure-ad-app-id');
+  console.error('BOT_PASSWORD=your-azure-ad-client-secret');
+  console.error('TENANT_ID=your-tenant-id (optional, defaults to "common")');
+  process.exit(1);
+}
+
+console.log('✅ Environment variables validated');
+
 // Import required packages
 const express = require("express");
 

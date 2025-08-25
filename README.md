@@ -56,20 +56,21 @@ npm start
 
 ### Using the Bot
 
-1. Install the bot in Microsoft Teams
-2. Use `/login` to authenticate via Teams SSO
-3. Ask natural language questions like:
+1. Install the bot in Microsoft Teams  
+2. Simply ask natural language questions - **authentication is automatic!**
    - "Send an email to john@company.com about the meeting"
    - "What's on my calendar tomorrow?"
    - "Find files named 'report' in my OneDrive"
 
+The bot will automatically authenticate with your Microsoft 365 account when needed using Teams SSO.
+
 
 ## Available Commands
 
-- `/login` - Authenticate via Teams SSO and test Microsoft 365 access
+- `/m365` - Check Microsoft 365 integration status
+- `/login` - Manually test authentication (optional - authentication is automatic)
 - `/logout` - Clear authentication tokens  
 - `/consent` - Grant Microsoft 365 permissions if needed
-- `/m365` - Check Microsoft 365 integration status
 - `/settoken <token>` - Manually set access token for testing
 
 ## Project Structure

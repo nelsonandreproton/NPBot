@@ -48,44 +48,70 @@ async function processUserQuery(context, query) {
     // Check if query requires M365 authentication
     if (await requiresM365Authentication(query)) {
       if (!userToken) {
-        await context.sendActivity('🔐 This action requires Microsoft 365 authentication. Please use /login command to authenticate.');
-        return;
-      }
-      
-      // Ask LLM to select M365 tool and extract parameters
-      toolSelectionResponse = await queryOllamaForM365ToolSelection(query, m365Tools);
-      
-      if (toolSelectionResponse && toolSelectionResponse.usesTool) {
-        console.log(`LLM selected M365 tool: ${toolSelectionResponse.toolName}`);
+        // Try to authenticate automatically in the background
+        await context.sendActivity('🔐 Authenticating with Microsoft 365...');
         
-        await context.sendActivity(`🔍 Using Microsoft 365 (${toolSelectionResponse.toolName})`);
-        
-        // Execute M365 tool
         try {
-          const result = await graphService.executeM365Tool(
-            userId,
-            userToken,
-            toolSelectionResponse.toolName,
-            toolSelectionResponse.parameters
-          );
-          
-          // Format and send the result
-          const formattedResult = await formatResultWithLLM(result, toolSelectionResponse.toolName, query);
-          const resultText = typeof formattedResult === 'string' ? formattedResult : JSON.stringify(formattedResult);
-          await context.sendActivity(resultText);
-          return;
+          userToken = await getUserGraphToken(context);
+          if (userToken) {
+            await context.sendActivity('✅ Authentication successful! Processing your request...');
+          }
         } catch (error) {
           if (error.message === 'CONSENT_REQUIRED') {
             await context.sendActivity({
               type: 'message',
+              text: '🔐 **Microsoft 365 Permissions Required**\n\nTo access your Microsoft 365 data, please grant permissions by clicking the button below:',
               attachments: [{
                 contentType: 'application/vnd.microsoft.card.adaptive',
                 content: teamsSSO.createConsentCard()
               }]
             });
             return;
+          } else {
+            console.error('Automatic authentication failed:', error);
+            await context.sendActivity('❌ Authentication failed. Please contact your administrator or use `/login` for more details.');
+            return;
           }
-          throw error;
+        }
+      }
+      
+      if (userToken) {
+        // Ask LLM to select M365 tool and extract parameters
+        toolSelectionResponse = await queryOllamaForM365ToolSelection(query, m365Tools);
+        
+        if (toolSelectionResponse && toolSelectionResponse.usesTool) {
+          console.log(`LLM selected M365 tool: ${toolSelectionResponse.toolName}`);
+          
+          await context.sendActivity(`🔍 Using Microsoft 365 (${toolSelectionResponse.toolName})`);
+          
+          // Execute M365 tool
+          try {
+            const result = await graphService.executeM365Tool(
+              userId,
+              userToken,
+              toolSelectionResponse.toolName,
+              toolSelectionResponse.parameters
+            );
+            
+            // Format and send the result
+            const formattedResult = await formatResultWithLLM(result, toolSelectionResponse.toolName, query);
+            const resultText = typeof formattedResult === 'string' ? formattedResult : JSON.stringify(formattedResult);
+            await context.sendActivity(resultText);
+            return;
+          } catch (error) {
+            if (error.message === 'CONSENT_REQUIRED') {
+              await context.sendActivity({
+                type: 'message',
+                text: '🔐 **Additional Permissions Required**\n\nPlease grant permissions to continue:',
+                attachments: [{
+                  contentType: 'application/vnd.microsoft.card.adaptive',
+                  content: teamsSSO.createConsentCard()
+                }]
+              });
+              return;
+            }
+            throw error;
+          }
         }
       }
     }
@@ -158,10 +184,17 @@ function clearUserToken(userId) {
 }
 
 async function requiresM365Authentication(query) {
-  // Simple keyword detection - could be enhanced with LLM analysis
+  // Comprehensive keyword detection for Microsoft 365 services
   const m365Keywords = [
-    'email', 'send email', 'inbox', 'calendar', 'schedule', 'meeting', 
-    'onedrive', 'files', 'documents', 'create file', 'search files'
+    // Email
+    'email', 'send email', 'mail', 'inbox', 'message', 'reply', 'forward',
+    // Calendar  
+    'calendar', 'schedule', 'meeting', 'appointment', 'event', 'available', 'busy',
+    // OneDrive/Files
+    'onedrive', 'files', 'documents', 'create file', 'search files', 'find file',
+    'document', 'spreadsheet', 'presentation', 'word', 'excel', 'powerpoint',
+    // General M365
+    'microsoft 365', 'm365', 'office 365', 'outlook', 'teams files'
   ];
   
   const queryLower = query.toLowerCase();
@@ -387,19 +420,19 @@ teamsBot.message("/login", async (context, state) => {
     if (token) {
       // Test the token by getting user profile
       const profile = await graphService.executeM365Tool(userId, token, 'get_user_profile', {});
-      await context.sendActivity(`✅ **Successfully authenticated via Teams SSO!**
+      await context.sendActivity(`✅ **Authentication Status**
 
 **Welcome, ${profile.displayName}** (${profile.mail})
 
-🟢 **Status:** Ready to use Microsoft 365 features
-📧 Send/read emails
-📅 Manage calendar events  
-📁 Access OneDrive files
-👤 Access profile information
+🟢 **Status:** Ready for Microsoft 365 features
+📧 Email access: Ready
+📅 Calendar access: Ready  
+📁 OneDrive access: Ready
+👤 Profile access: Ready
 
-You can now ask me things like:
+**Note:** You don't need to run /login manually. I'll automatically authenticate when you ask Microsoft 365 questions like:
 • "send an email to john@company.com"
-• "check my calendar for tomorrow"  
+• "what's on my calendar tomorrow"  
 • "find files named report"`);
     }
   } catch (error) {
@@ -528,7 +561,15 @@ teamsBot.message("/m365", async (context, state) => {
 });
 
 teamsBot.conversationUpdate("membersAdded", async (context, state) => {
-  const welcomeMessage = `Hello! I'm NP AI Assistant. How can I help you? 😊`;
+  const welcomeMessage = `Hello! I'm **NP AI Assistant**. I can help you with Microsoft 365 tasks using natural language! 🤖
+
+**Try asking me:**
+• "Send an email to john@company.com about the meeting"
+• "What's on my calendar tomorrow?"  
+• "Find files named 'report' in my OneDrive"
+• "Check my recent emails"
+
+I'll automatically authenticate with your Microsoft 365 account when needed. No need to login first! ✨`;
   
   await context.sendActivity(welcomeMessage);
 });

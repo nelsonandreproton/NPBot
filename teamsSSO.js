@@ -2,13 +2,40 @@ const { ConfidentialClientApplication } = require('@azure/msal-node');
 
 class TeamsSSO {
   constructor() {
-    this.clientApp = new ConfidentialClientApplication({
-      auth: {
-        clientId: process.env.BOT_ID, // Your bot's client ID
-        clientSecret: process.env.BOT_PASSWORD, // Your bot's client secret
-        authority: `https://login.microsoftonline.com/${process.env.TENANT_ID || 'common'}`
-      }
-    });
+    // Validate required environment variables
+    const requiredEnvVars = {
+      BOT_ID: process.env.BOT_ID,
+      BOT_PASSWORD: process.env.BOT_PASSWORD,
+      TENANT_ID: process.env.TENANT_ID || 'common'
+    };
+
+    // Check for missing environment variables
+    const missingVars = Object.entries(requiredEnvVars)
+      .filter(([key, value]) => !value || value.trim() === '')
+      .map(([key]) => key);
+
+    if (missingVars.length > 0) {
+      throw new Error(`Missing required environment variables: ${missingVars.join(', ')}. Please check your .env file or Azure App Service configuration.`);
+    }
+
+    console.log('Environment variables loaded:');
+    console.log(`BOT_ID: ${requiredEnvVars.BOT_ID ? requiredEnvVars.BOT_ID.substring(0, 8) + '...' : 'MISSING'}`);
+    console.log(`BOT_PASSWORD: ${requiredEnvVars.BOT_PASSWORD ? '*'.repeat(8) : 'MISSING'}`);
+    console.log(`TENANT_ID: ${requiredEnvVars.TENANT_ID}`);
+
+    try {
+      this.clientApp = new ConfidentialClientApplication({
+        auth: {
+          clientId: requiredEnvVars.BOT_ID,
+          clientSecret: requiredEnvVars.BOT_PASSWORD,
+          authority: `https://login.microsoftonline.com/${requiredEnvVars.TENANT_ID}`
+        }
+      });
+      console.log('✅ MSAL ConfidentialClientApplication initialized successfully');
+    } catch (error) {
+      console.error('❌ Failed to initialize MSAL client:', error.message);
+      throw error;
+    }
   }
 
   /**
@@ -32,10 +59,10 @@ class TeamsSSO {
         oboAssertion: context.activity.channelData?.ssoToken || 
                       await this.getTeamsSSOToken(context),
         scopes: [
-          'https://graph.microsoft.com/Mail.ReadWrite',
-          'https://graph.microsoft.com/Calendars.ReadWrite', 
-          'https://graph.microsoft.com/Files.ReadWrite',
-          'https://graph.microsoft.com/User.Read'
+          'Mail.ReadWrite',
+          'Calendars.ReadWrite', 
+          'Files.ReadWrite',
+          'User.Read'
         ],
         skipCache: false
       };
