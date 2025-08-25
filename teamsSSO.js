@@ -1,4 +1,5 @@
 const { ConfidentialClientApplication } = require('@azure/msal-node');
+const tokenStorage = require('./tokenStorage');
 
 class TeamsSSO {
   constructor() {
@@ -39,11 +40,10 @@ class TeamsSSO {
   }
 
   /**
-   * Exchange Teams SSO token for Microsoft Graph token
+   * Get Microsoft Graph token using Bot Framework OAuth
    */
   async getGraphTokenFromTeamsSSO(context) {
     try {
-      // Get the user's AAD object ID from Teams context
       const userAadObjectId = context.activity.from.aadObjectId;
       const userPrincipalName = context.activity.from.userPrincipalName;
       
@@ -52,41 +52,141 @@ class TeamsSSO {
       }
 
       console.log(`Getting Graph token for user: ${userPrincipalName} (${userAadObjectId})`);
+      console.log('Adapter type:', context.adapter.constructor.name);
 
-      // Use On-Behalf-Of flow to get Graph token
-      // Note: This requires the user to have already consented to the app's permissions
-      const oboRequest = {
-        oboAssertion: context.activity.channelData?.ssoToken || 
-                      await this.getTeamsSSOToken(context),
-        scopes: [
-          'Mail.ReadWrite',
-          'Calendars.ReadWrite', 
-          'Files.ReadWrite',
-          'User.Read'
-        ],
-        skipCache: false
-      };
-
-      const response = await this.clientApp.acquireTokenOnBehalfOf(oboRequest);
+      // Try our custom token storage first (for previously authenticated users)
+      console.log('Checking custom token storage...');
+      const storedToken = tokenStorage.getToken(userAadObjectId);
       
-      if (response && response.accessToken) {
-        console.log(`Successfully obtained Graph token for ${userPrincipalName}`);
-        return response.accessToken;
+      if (storedToken) {
+        console.log(`Found valid token in custom storage for ${userPrincipalName}`);
+        
+        // Validate the token before using it
+        const userInfo = await this.validateUserToken(userAadObjectId, storedToken);
+        if (userInfo) {
+          console.log(`Token validation successful for ${userInfo.displayName}`);
+          return storedToken;
+        } else {
+          console.log('Stored token is invalid, clearing it');
+          tokenStorage.clearToken(userAadObjectId);
+        }
+      }
+
+      // Try different CloudAdapter methods to get OAuth token
+      const adapter = context.adapter;
+      
+      // Method 1: Try getUserToken (standard Bot Framework)
+      if (typeof adapter.getUserToken === 'function') {
+        try {
+          console.log('Trying getUserToken method...');
+          const tokenResponse = await adapter.getUserToken(context, 'MicrosoftGraph');
+          
+          if (tokenResponse && tokenResponse.token) {
+            console.log(`Successfully obtained Graph token via getUserToken for ${userPrincipalName}`);
+            // Store token for future use
+            tokenStorage.setToken(userAadObjectId, tokenResponse.token, tokenResponse.expiration);
+            return tokenResponse.token;
+          }
+        } catch (error) {
+          console.log('getUserToken method failed:', error.message);
+        }
       }
       
-      throw new Error('No access token received from OBO flow');
+      // Method 2: Try getOAuthToken (CloudAdapter specific)  
+      if (typeof adapter.getOAuthToken === 'function') {
+        try {
+          console.log('Trying getOAuthToken method...');
+          const tokenResponse = await adapter.getOAuthToken(context, 'MicrosoftGraph');
+          
+          if (tokenResponse && tokenResponse.token) {
+            console.log(`Successfully obtained Graph token via getOAuthToken for ${userPrincipalName}`);
+            // Store token for future use
+            tokenStorage.setToken(userAadObjectId, tokenResponse.token, tokenResponse.expiration);
+            return tokenResponse.token;
+          }
+        } catch (error) {
+          console.log('getOAuthToken method failed:', error.message);
+        }
+      }
+      
+      // Method 3: Try getTokenStatus 
+      if (typeof adapter.getTokenStatus === 'function') {
+        try {
+          console.log('Trying getTokenStatus method...');
+          const tokenStatus = await adapter.getTokenStatus(context, 'MicrosoftGraph');
+          
+          if (tokenStatus && tokenStatus.length > 0 && tokenStatus[0].token) {
+            console.log(`Successfully obtained Graph token via getTokenStatus for ${userPrincipalName}`);
+            // Store token for future use
+            tokenStorage.setToken(userAadObjectId, tokenStatus[0].token);
+            return tokenStatus[0].token;
+          }
+        } catch (error) {
+          console.log('getTokenStatus method failed:', error.message);
+        }
+      }
+
+      // Method 4: Try to use the OAuth connection directly with CloudAdapter
+      if (typeof adapter.processActivity === 'function') {
+        try {
+          console.log('Trying direct OAuth connection access...');
+          
+          // Check if there's an ongoing OAuth flow or existing token
+          const botFrameworkToken = await this.getBotFrameworkToken(context);
+          if (botFrameworkToken) {
+            console.log(`Successfully obtained token via Bot Framework OAuth for ${userPrincipalName}`);
+            tokenStorage.setToken(userAadObjectId, botFrameworkToken);
+            return botFrameworkToken;
+          }
+        } catch (error) {
+          console.log('Direct OAuth connection access failed:', error.message);
+        }
+      }
+
+      console.log('All token retrieval methods failed, user needs to sign in');
+      console.log('Available adapter methods:', Object.getOwnPropertyNames(Object.getPrototypeOf(adapter)).filter(name => name.includes('oken') || name.includes('auth')));
+      
+      throw new Error('CONSENT_REQUIRED');
       
     } catch (error) {
-      console.error('Teams SSO token exchange failed:', error);
+      console.error('Graph token acquisition failed:', error);
       
       // Check for specific error types
-      if (error.errorCode === 'invalid_grant') {
-        throw new Error('User needs to consent to app permissions. Please run /consent command first.');
-      } else if (error.errorCode === 'unauthorized_client') {
-        throw new Error('Bot is not authorized for this operation. Check Azure AD app configuration.');
+      if (error.message === 'CONSENT_REQUIRED') {
+        throw error;
+      } else if (error.message && error.message.includes('consent')) {
+        throw new Error('CONSENT_REQUIRED');
       }
       
       throw error;
+    }
+  }
+
+  /**
+   * Attempt to get token through Bot Framework OAuth connection
+   */
+  async getBotFrameworkToken(context) {
+    try {
+      // Use the Bot Framework REST API to get the OAuth token
+      const { botConnectorFactory } = require('@microsoft/agents-hosting');
+      
+      if (botConnectorFactory) {
+        const connector = botConnectorFactory.create();
+        if (connector && typeof connector.getOAuthToken === 'function') {
+          const tokenResponse = await connector.getOAuthToken(
+            context.activity.from.id,
+            'MicrosoftGraph',
+            context.activity.channelId
+          );
+          
+          return tokenResponse ? tokenResponse.token : null;
+        }
+      }
+      
+      return null;
+    } catch (error) {
+      console.log('Bot Framework OAuth token retrieval failed:', error.message);
+      return null;
     }
   }
 
@@ -107,53 +207,135 @@ class TeamsSSO {
   }
 
   /**
-   * Create an OAuth sign-in card for consent when SSO fails
+   * Create a Hero Card with direct Azure AD OAuth URL (bypasses Bot Framework OAuth connection issues)
    */
-  createConsentCard() {
-    const signInLink = `https://login.microsoftonline.com/${process.env.TENANT_ID || 'common'}/oauth2/v2.0/authorize?` +
+  createConsentMessage() {
+    // Generate direct Azure AD OAuth URL
+    const redirectUri = encodeURIComponent('https://token.botframework.com/.auth/web/redirect');
+    const scopes = encodeURIComponent('https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Files.ReadWrite https://graph.microsoft.com/User.Read offline_access');
+    const state = encodeURIComponent(`MicrosoftGraph-${Date.now()}`);
+    
+    const authUrl = `https://login.microsoftonline.com/${process.env.TENANT_ID}/oauth2/v2.0/authorize?` +
       `client_id=${process.env.BOT_ID}&` +
       `response_type=code&` +
-      `scope=https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Files.ReadWrite https://graph.microsoft.com/User.Read&` +
-      `response_mode=query`;
+      `redirect_uri=${redirectUri}&` +
+      `response_mode=query&` +
+      `scope=${scopes}&` +
+      `state=${state}&` +
+      `prompt=consent`;
 
     return {
-      type: 'AdaptiveCard',
-      version: '1.4',
-      body: [
-        {
-          type: 'TextBlock',
-          text: '🔐 Microsoft 365 Authentication Required',
-          weight: 'Bolder',
-          size: 'Medium'
-        },
-        {
-          type: 'TextBlock',
-          text: 'To access your Microsoft 365 data (email, calendar, files), please sign in and grant permissions.',
-          wrap: true
-        },
-        {
-          type: 'TextBlock',
-          text: 'Required Permissions:',
-          weight: 'Bolder'
-        },
-        {
-          type: 'TextBlock',
-          text: '• Mail.ReadWrite - Send and read emails\n• Calendars.ReadWrite - Manage calendar events\n• Files.ReadWrite - Access OneDrive files\n• User.Read - Get profile information',
-          wrap: true
+      type: 'message',
+      attachments: [{
+        contentType: 'application/vnd.microsoft.card.hero',
+        content: {
+          title: '🔐 Microsoft 365 Authentication Required',
+          subtitle: 'Sign in to access your emails, calendar, and files',
+          text: `**Permissions needed:**\n📧 Mail.ReadWrite - Send and read emails\n📅 Calendars.ReadWrite - Manage calendar events\n📁 Files.ReadWrite - Access OneDrive files\n👤 User.Read - Profile information\n\n*One-time setup - you won't need to sign in again.*`,
+          images: [{
+            url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Microsoft_logo.svg/512px-Microsoft_logo.svg.png'
+          }],
+          buttons: [{
+            type: 'openUrl',
+            title: '🔗 Sign In to Microsoft 365',
+            value: authUrl
+          }]
         }
-      ],
-      actions: [
-        {
-          type: 'Action.OpenUrl',
-          title: 'Sign In to Microsoft 365',
-          url: signInLink
-        }
-      ]
+      }]
     };
   }
 
   /**
-   * Alternative: Use Teams authentication with OAuthCards
+   * Create a Hero Card with proper Bot Framework OAuth URL as fallback
+   */
+  async createConsentMessageHero(context) {
+    // Get proper Bot Framework OAuth URL with session management
+    const botFrameworkUrl = await this.getBotFrameworkSignInUrl(context);
+
+    return {
+      type: 'message',
+      attachments: [{
+        contentType: 'application/vnd.microsoft.card.hero',
+        content: {
+          title: '🔐 Microsoft 365 Authentication Required',
+          subtitle: 'Sign in to access your emails, calendar, and files',
+          text: `**Permissions needed:**\n📧 Mail.ReadWrite - Send and read emails\n📅 Calendars.ReadWrite - Manage calendar events\n📁 Files.ReadWrite - Access OneDrive files\n👤 User.Read - Profile information\n\n*One-time setup - you won't need to sign in again.*`,
+          images: [{
+            url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Microsoft_logo.svg/512px-Microsoft_logo.svg.png'
+          }],
+          buttons: [{
+            type: 'openUrl',
+            title: '🔗 Sign In to Microsoft 365',
+            value: botFrameworkUrl
+          }]
+        }
+      }]
+    };
+  }
+
+  /**
+   * Generate proper Bot Framework OAuth URL with session management
+   */
+  generateBotFrameworkOAuthUrl(context) {
+    const userId = context.activity.from.id;
+    const channelId = context.activity.channelId;
+    const serviceUrl = context.activity.serviceUrl;
+    const conversationId = context.activity.conversation.id;
+    
+    // Generate a proper state parameter that Bot Framework can track
+    const state = `${encodeURIComponent('MicrosoftGraph')}-${Date.now()}-${encodeURIComponent(userId)}`;
+    
+    // Use Bot Framework's OAuth endpoint that handles session cookies properly
+    const botFrameworkOAuthUrl = `https://token.botframework.com/api/oauth/GetSigninLink?` +
+      `botId=${encodeURIComponent(process.env.BOT_ID)}&` +
+      `connectionName=${encodeURIComponent('MicrosoftGraph')}&` +
+      `userId=${encodeURIComponent(userId)}&` +
+      `channelId=${encodeURIComponent(channelId)}&` +
+      `serviceUrl=${encodeURIComponent(serviceUrl)}&` +
+      `conversationId=${encodeURIComponent(conversationId)}&` +
+      `state=${state}`;
+
+    return botFrameworkOAuthUrl;
+  }
+
+  /**
+   * Get simplified OAuth sign-in URL (avoiding Bot Framework REST API issues)
+   */
+  async getBotFrameworkSignInUrl(context) {
+    // Use the manual URL generation method since Bot Framework REST API has auth issues
+    return this.generateBotFrameworkOAuthUrl(context);
+  }
+
+  /**
+   * Create admin consent message as fallback
+   */
+  createAdminConsentMessage() {
+    return `🔐 **Microsoft 365 Permissions Required**
+
+**Option 1: Admin Consent (Recommended)**
+Your administrator can grant consent for all users:
+
+1. Go to [Azure Portal](https://portal.azure.com)
+2. Navigate to **Azure Active Directory** → **App registrations**  
+3. Find app: **${process.env.BOT_ID}**
+4. Go to **API permissions**
+5. Click **"Grant admin consent for [Organization]"**
+6. Click **"Yes"** to approve
+
+After admin consent, all users can use M365 features automatically!
+
+**Option 2: Individual User Consent**
+For individual user consent, you need to:
+1. Set up OAuth Connection in Azure Bot Service
+2. Configure connection name: "MicrosoftGraph"
+3. Use the proper OAuth flow
+
+**Required permissions:**
+📧 Mail.ReadWrite, 📅 Calendars.ReadWrite, 📁 Files.ReadWrite, 👤 User.Read`;
+  }
+
+  /**
+   * Alternative: Use Teams authentication with OAuthCards (requires Bot Framework OAuth Connection)
    */
   createOAuthCard() {
     return {
@@ -162,12 +344,12 @@ class TeamsSSO {
         {
           contentType: 'application/vnd.microsoft.card.oauth',
           content: {
-            text: 'Please sign in to Microsoft 365',
-            connectionName: 'Microsoft365Connection', // Configured in Azure Bot Service
+            text: 'Please sign in to Microsoft 365 to access your data',
+            connectionName: 'MicrosoftGraph', // This must match the connection name in Azure Bot Service
             buttons: [
               {
-                type: 'signin',
-                title: 'Sign In',
+                type: 'signin', 
+                title: 'Sign In to Microsoft 365',
                 value: 'https://login.microsoftonline.com/'
               }
             ]
@@ -214,6 +396,58 @@ class TeamsSSO {
       id: context.activity.from.id,
       tenantId: context.activity.channelData?.tenant?.id
     };
+  }
+
+  /**
+   * Handle incoming OAuth tokens from Bot Framework OAuth connection
+   */
+  async handleOAuthCallback(context) {
+    try {
+      const userAadObjectId = context.activity.from.aadObjectId;
+      const userPrincipalName = context.activity.from.userPrincipalName;
+      
+      // Check if this is an OAuth callback
+      if (context.activity.name === 'signin/tokenExchange' || 
+          context.activity.name === 'signin/verifyState' ||
+          context.activity.channelData?.postback) {
+        
+        console.log(`OAuth callback received for user: ${userPrincipalName}`);
+        
+        // Try to get the token from the callback
+        let token = null;
+        
+        if (context.activity.value && context.activity.value.token) {
+          token = context.activity.value.token;
+        } else if (context.activity.channelData?.postback?.data) {
+          // Parse token from postback data
+          try {
+            const data = JSON.parse(context.activity.channelData.postback.data);
+            token = data.token;
+          } catch (e) {
+            console.log('Failed to parse postback data:', e.message);
+          }
+        }
+        
+        if (token) {
+          // Validate and store the token
+          const userInfo = await this.validateUserToken(userAadObjectId, token);
+          if (userInfo) {
+            tokenStorage.setToken(userAadObjectId, token);
+            console.log(`OAuth token successfully stored for ${userInfo.displayName}`);
+            
+            return {
+              success: true,
+              message: `✅ Successfully signed in to Microsoft 365 as ${userInfo.displayName}!\n\nYou can now ask questions about your emails, calendar, and files. Try asking:\n• "What's on my calendar today?"\n• "Show me my recent emails"\n• "Find files in my OneDrive"`
+            };
+          }
+        }
+      }
+      
+      return { success: false };
+    } catch (error) {
+      console.error('OAuth callback handling failed:', error);
+      return { success: false, error: error.message };
+    }
   }
 }
 

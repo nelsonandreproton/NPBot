@@ -8,6 +8,7 @@ const {
 const { version } = require("@microsoft/agents-hosting/package.json");
 const MicrosoftGraphService = require("./microsoftGraphService");
 const TeamsSSO = require("./teamsSSO");
+const tokenStorage = require("./tokenStorage");
 
 const downloader = new AttachmentDownloader();
 
@@ -30,23 +31,28 @@ async function processUserQuery(context, query) {
   const userId = context.activity.from.id;
   
   try {
-    // Get available M365 tools
-    const m365Tools = graphService.getAvailableM365Tools();
+    // Only try M365 authentication if it's actually needed
+    const needsAuth = await requiresM365Authentication(query);
+    console.log(`Query: "${query}" - Needs M365 auth: ${needsAuth}`);
     
-    // Try to get M365 token using Teams SSO
-    let userToken = null;
-    try {
-      userToken = await getUserGraphToken(context);
-    } catch (error) {
-      if (error.message === 'CONSENT_REQUIRED') {
-        console.log('User consent required for M365 access');
-      } else {
-        console.warn('Failed to get Graph token:', error.message);
+    if (!needsAuth) {
+      // Skip M365 entirely for non-M365 queries
+      console.log('Skipping M365 authentication - not needed for this query');
+    } else {
+      // Get available M365 tools
+      const m365Tools = graphService.getAvailableM365Tools();
+      
+      // Try to get M365 token using Teams SSO
+      let userToken = null;
+      try {
+        userToken = await getUserGraphToken(context);
+      } catch (error) {
+        if (error.message === 'CONSENT_REQUIRED') {
+          console.log('User consent required for M365 access');
+        } else {
+          console.warn('Failed to get Graph token:', error.message);
+        }
       }
-    }
-    
-    // Check if query requires M365 authentication
-    if (await requiresM365Authentication(query)) {
       if (!userToken) {
         // Try to authenticate automatically in the background
         await context.sendActivity('🔐 Authenticating with Microsoft 365...');
@@ -58,14 +64,12 @@ async function processUserQuery(context, query) {
           }
         } catch (error) {
           if (error.message === 'CONSENT_REQUIRED') {
-            await context.sendActivity({
-              type: 'message',
-              text: '🔐 **Microsoft 365 Permissions Required**\n\nTo access your Microsoft 365 data, please grant permissions by clicking the button below:',
-              attachments: [{
-                contentType: 'application/vnd.microsoft.card.adaptive',
-                content: teamsSSO.createConsentCard()
-              }]
-            });
+            // Use OAuth Card for best Teams integration
+            console.log('🔐 Sending OAuth card for Microsoft 365 authentication');
+            const oauthCard = teamsSSO.createConsentMessage();
+            console.log('OAuth card content:', JSON.stringify(oauthCard, null, 2));
+            await context.sendActivity(oauthCard);
+            console.log('✅ OAuth card sent successfully');
             return;
           } else {
             console.error('Automatic authentication failed:', error);
@@ -100,14 +104,12 @@ async function processUserQuery(context, query) {
             return;
           } catch (error) {
             if (error.message === 'CONSENT_REQUIRED') {
-              await context.sendActivity({
-                type: 'message',
-                text: '🔐 **Additional Permissions Required**\n\nPlease grant permissions to continue:',
-                attachments: [{
-                  contentType: 'application/vnd.microsoft.card.adaptive',
-                  content: teamsSSO.createConsentCard()
-                }]
-              });
+              // Use OAuth Card for best Teams integration
+              console.log('🔐 Sending OAuth card for M365 tool execution');
+              const oauthCard = teamsSSO.createConsentMessage();
+              console.log('OAuth card content:', JSON.stringify(oauthCard, null, 2));
+              await context.sendActivity(oauthCard);
+              console.log('✅ OAuth card sent successfully');
               return;
             }
             throw error;
@@ -116,18 +118,40 @@ async function processUserQuery(context, query) {
       }
     }
   } catch (error) {
-    console.error('M365 tool execution failed:', error);
-    await context.sendActivity('❌ Microsoft 365 tool execution failed. Using direct LLM response...');
+    console.error('Query processing failed:', error);
+    await context.sendActivity('❌ Sorry, I encountered an error processing your request. Please try again.');
+    return; // Exit early to prevent multiple responses
   }
   
-  // Fallback to direct LLM response
+  // Fallback to direct LLM response only if we haven't sent a response yet
   console.log('Using direct LLM response');
   try {
     const llmReply = await queryOllama(query);
+    if (llmReply && (llmReply.includes('HTTP Error') || llmReply.includes('<!DOCTYPE html>'))) {
+      throw new Error('Ollama service returned HTML error page');
+    }
     await context.sendActivity(llmReply);
   } catch (error) {
-    await context.sendActivity('Sorry, could not reach any service to process your request.');
     console.error('LLM fallback error:', error);
+    
+    // Provide helpful response when Ollama is unavailable
+    if (error.message.includes('Ollama') || error.message.includes('HTML') || error.message.includes('401')) {
+      await context.sendActivity(`Hi! I'm currently having trouble connecting to the AI service (Ollama).
+
+**For Microsoft 365 questions**, try:
+• "check my calendar"  
+• "send an email to someone@company.com"
+• "find files in my OneDrive"
+
+**For help with the bot**, use:
+• \`/oauth-check\` - Check authentication setup
+• \`/debug\` - View bot diagnostics
+• \`/m365\` - Check Microsoft 365 status
+
+*Note: The AI chat feature requires Ollama to be running and accessible.*`);
+    } else {
+      await context.sendActivity('Sorry, could not reach any service to process your request.');
+    }
   }
 }
 
@@ -184,6 +208,11 @@ function clearUserToken(userId) {
 }
 
 async function requiresM365Authentication(query) {
+  // Don't require auth for bot commands
+  if (query.startsWith('/')) {
+    return false;
+  }
+  
   // Comprehensive keyword detection for Microsoft 365 services
   const m365Keywords = [
     // Email
@@ -328,23 +357,28 @@ function extractUserQuery(text, context) {
 async function queryOllama(prompt) {
   const ollamaUrl = (process.env.OLLAMA_URL || 'http://localhost:11434') + '/api/generate';
   
-  // Prepare headers
-  const headers = { 'Content-Type': 'application/json' };
-  
-  // Add basic authentication if credentials are provided
-  if (process.env.OLLAMA_AUTH_USER && process.env.OLLAMA_AUTH_PASS) {
-    const credentials = Buffer.from(`${process.env.OLLAMA_AUTH_USER}:${process.env.OLLAMA_AUTH_PASS}`).toString('base64');
-    headers['Authorization'] = `Basic ${credentials}`;
-  }
-  
-  const response = await fetch(ollamaUrl, {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify({
-      model: 'gemma2:2b', // Adjust model name to match your Ollama config
-      prompt: prompt
-    })
-  });
+  try {
+    // Prepare headers
+    const headers = { 'Content-Type': 'application/json' };
+    
+    // Add basic authentication if credentials are provided
+    if (process.env.OLLAMA_AUTH_USER && process.env.OLLAMA_AUTH_PASS) {
+      const credentials = Buffer.from(`${process.env.OLLAMA_AUTH_USER}:${process.env.OLLAMA_AUTH_PASS}`).toString('base64');
+      headers['Authorization'] = `Basic ${credentials}`;
+    }
+    
+    const response = await fetch(ollamaUrl, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({
+        model: 'gemma2:2b', // Adjust model name to match your Ollama config
+        prompt: prompt
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+    }
 
 // Stream & parse NDJSON
   const reader = response.body.getReader();
@@ -378,6 +412,14 @@ async function queryOllama(prompt) {
   }
   // Optionally process any remaining buffer data
   return resultText || "No response from LLM.";
+  
+  } catch (error) {
+    console.error('Ollama query error:', error);
+    if (error.message.includes('HTML')) {
+      return "Ollama service unavailable. Please check that Ollama is running and accessible.";
+    }
+    throw error;
+  }
 }
 
 // Listen for user to say '/reset' and then delete conversation state
@@ -437,14 +479,9 @@ teamsBot.message("/login", async (context, state) => {
     }
   } catch (error) {
     if (error.message === 'CONSENT_REQUIRED') {
-      await context.sendActivity({
-        type: 'message',
-        text: '🔐 **Microsoft 365 Authentication Required**\n\nYour Teams session is active, but additional permissions are needed for Microsoft 365 features.',
-        attachments: [{
-          contentType: 'application/vnd.microsoft.card.adaptive',
-          content: teamsSSO.createConsentCard()
-        }]
-      });
+      // Use OAuth Card for best Teams integration  
+      const oauthCard = teamsSSO.createConsentMessage();
+      await context.sendActivity(oauthCard);
     } else {
       await context.sendActivity(`❌ **Authentication Failed**
 
@@ -486,6 +523,7 @@ teamsBot.message("/logout", async (context, state) => {
 
 teamsBot.message("/settoken", async (context, state) => {
   const userId = context.activity.from.id;
+  const userAadObjectId = context.activity.from.aadObjectId;
   const text = context.activity.text || '';
   const tokenMatch = text.match(/\/settoken\s+(.+)/);
   
@@ -495,15 +533,236 @@ teamsBot.message("/settoken", async (context, state) => {
   }
   
   const token = tokenMatch[1].trim();
+  
+  // Store in both the old system and new system
   setUserToken(userId, token);
+  if (userAadObjectId) {
+    tokenStorage.setToken(userAadObjectId, token);
+  }
   
   try {
     // Test the token by getting user profile
     const profile = await graphService.executeM365Tool(userId, token, 'get_user_profile', {});
-    await context.sendActivity(`✅ Token set successfully!\n\n**Welcome, ${profile.displayName}** (${profile.mail})\n\nYou can now use Microsoft 365 features like:\n- Send/read emails\n- Manage calendar\n- Access OneDrive files`);
+    await context.sendActivity(`✅ Token set successfully!\n\n**Welcome, ${profile.displayName}** (${profile.mail})\n\nYou can now use Microsoft 365 features like:\n- Send/read emails\n- Manage calendar\n- Access OneDrive files\n\n*Token stored for AAD Object ID: ${userAadObjectId}*`);
   } catch (error) {
     clearUserToken(userId);
+    if (userAadObjectId) {
+      tokenStorage.clearToken(userAadObjectId);
+    }
     await context.sendActivity(`❌ Invalid token or insufficient permissions.\n\nError: ${error.message}\n\nPlease ensure your token has the required scopes: Mail.ReadWrite, Calendars.ReadWrite, Files.ReadWrite, User.Read`);
+  }
+});
+
+teamsBot.message("/tokens", async (context, state) => {
+  const userId = context.activity.from.id;
+  const userAadObjectId = context.activity.from.aadObjectId;
+  
+  try {
+    const allTokens = tokenStorage.getAllTokens();
+    const hasLegacyToken = getUserToken(userId) ? 'Yes' : 'No';
+    const hasNewToken = userAadObjectId && tokenStorage.getToken(userAadObjectId) ? 'Yes' : 'No';
+    
+    await context.sendActivity(`**Token Status**
+
+**Your Tokens:**
+• Legacy token (by user ID): ${hasLegacyToken}
+• New token (by AAD Object ID): ${hasNewToken}
+• Your AAD Object ID: ${userAadObjectId || 'Not available'}
+
+**All stored tokens:** ${Object.keys(allTokens).length}
+${Object.keys(allTokens).length > 0 ? JSON.stringify(allTokens, null, 2) : 'No tokens stored'}`);
+    
+  } catch (error) {
+    await context.sendActivity(`Error checking tokens: ${error.message}`);
+  }
+});
+
+teamsBot.message("/debug", async (context, state) => {
+  try {
+    const adapter = context.adapter;
+    const adapterMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(adapter));
+    const authMethods = adapterMethods.filter(name => 
+      name.includes('oken') || name.includes('auth') || name.includes('OAuth')
+    );
+    
+    // Test OAuth connection attempt
+    let oauthTestResult = 'Not tested';
+    try {
+      const tokenAttempt = await teamsSSO.getGraphTokenFromTeamsSSO(context);
+      oauthTestResult = tokenAttempt ? 'Token available' : 'No token found';
+    } catch (error) {
+      oauthTestResult = `Error: ${error.message}`;
+    }
+    
+    await context.sendActivity(`**Debug Information**
+
+**Adapter Type:** ${adapter.constructor.name}
+
+**Available Authentication Methods:**
+${authMethods.length > 0 ? authMethods.map(m => `• ${m}`).join('\n') : 'No authentication methods found'}
+
+**OAuth Test Result:** ${oauthTestResult}
+
+**User Info:**
+• ID: ${context.activity.from.id}
+• Name: ${context.activity.from.name}
+• AAD Object ID: ${context.activity.from.aadObjectId || 'Not available'}
+• UPN: ${context.activity.from.userPrincipalName || 'Not available'}
+
+**Bot Configuration:**
+• BOT_ID: ${process.env.BOT_ID ? process.env.BOT_ID.substring(0, 8) + '...' : 'Not set'}
+• TENANT_ID: ${process.env.TENANT_ID || 'Not set'}
+
+**Activity Info:**
+• Channel ID: ${context.activity.channelId}
+• Service URL: ${context.activity.serviceUrl}
+• Conversation ID: ${context.activity.conversation.id}`);
+    
+  } catch (error) {
+    await context.sendActivity(`Debug error: ${error.message}`);
+  }
+});
+
+teamsBot.message("/oauth-check", async (context, state) => {
+  try {
+    // Try to test the actual OAuth connection
+    let connectionTest = 'Not tested';
+    try {
+      // Test if we can access OAuth via the adapter
+      const adapter = context.adapter;
+      const userId = context.activity.from.id;
+      
+      // Check available methods
+      const adapterMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(adapter));
+      const oauthMethods = adapterMethods.filter(name => 
+        name.includes('oken') || name.includes('OAuth') || name.includes('signin')
+      );
+      
+      connectionTest = `Available OAuth methods: ${oauthMethods.length > 0 ? oauthMethods.join(', ') : 'None found'}`;
+      
+      // Try to get sign-in link if possible
+      if (typeof adapter.getSignInLink === 'function') {
+        try {
+          const signInLink = await adapter.getSignInLink(context, 'MicrosoftGraph');
+          connectionTest += `\nSign-in link: ${signInLink ? 'Available' : 'Failed'}`;
+        } catch (e) {
+          connectionTest += `\nSign-in link error: ${e.message}`;
+        }
+      }
+      
+    } catch (e) {
+      connectionTest = `Connection test failed: ${e.message}`;
+    }
+
+    await context.sendActivity(`**OAuth Connection Diagnostics**
+
+**Your Bot Configuration:**
+• BOT_ID: \`${process.env.BOT_ID}\`
+• TENANT_ID: \`${process.env.TENANT_ID}\`
+• Adapter: ${context.adapter.constructor.name}
+
+**OAuth Connection Test:**
+${connectionTest}
+
+**Expected Azure Configuration:**
+• Connection Name: \`MicrosoftGraph\` (case sensitive!)
+• Service Provider: \`Azure Active Directory v2\`
+• Client ID: \`${process.env.BOT_ID}\`
+• Tenant ID: \`${process.env.TENANT_ID}\`
+
+**Required Scopes (all must be present):**
+• \`https://graph.microsoft.com/Mail.ReadWrite\`
+• \`https://graph.microsoft.com/Calendars.ReadWrite\`
+• \`https://graph.microsoft.com/Files.ReadWrite\`
+• \`https://graph.microsoft.com/User.Read\`
+• \`offline_access\`
+
+**If Test Connection succeeds but card fails:**
+1. Delete existing OAuth connection completely
+2. Create new connection with EXACTLY these settings:
+   - Name: \`MicrosoftGraph\`
+   - Service Provider: \`Azure Active Directory v2\`
+   - Client ID: ${process.env.BOT_ID}
+   - Client Secret: [your bot password]
+   - Tenant ID: ${process.env.TENANT_ID}
+   - All 5 scopes listed above
+
+**Alternative: Try Standard OAuth Card**
+The issue might be with OAuth card rendering. Try \`/test-oauth\` for a different approach.`);
+    
+  } catch (error) {
+    await context.sendActivity(`OAuth check error: ${error.message}`);
+  }
+});
+
+teamsBot.message("/test-oauth", async (context, state) => {
+  try {
+    console.log('Testing alternative OAuth card approach');
+    
+    // Try the standard OAuth card approach
+    const oauthCard = {
+      type: 'message',
+      attachments: [{
+        contentType: 'application/vnd.microsoft.card.oauth',
+        content: {
+          text: 'Please sign in to Microsoft 365',
+          connectionName: 'MicrosoftGraph',
+          buttons: [{
+            type: 'signin',
+            title: 'Sign In',
+            value: 'https://login.microsoftonline.com/'
+          }]
+        }
+      }]
+    };
+    
+    await context.sendActivity(oauthCard);
+    console.log('OAuth card sent successfully');
+    
+  } catch (error) {
+    console.error('OAuth card test failed:', error);
+    await context.sendActivity(`OAuth card test failed: ${error.message}`);
+  }
+});
+
+teamsBot.message("/get-token", async (context, state) => {
+  try {
+    await context.sendActivity(`**Manual Token Generation Guide**
+
+Since admin consent is required, here are alternative ways to get a token for testing:
+
+**Option 1: Use Graph Explorer (Easiest)**
+1. Go to https://developer.microsoft.com/graph/graph-explorer
+2. Sign in with your Microsoft 365 account
+3. In the left panel, expand "Mail", "Calendar", or "Files" 
+4. Click any API (like "get my messages")
+5. Click "Run Query" and consent to permissions
+6. Click the "Access Token" tab in the response area
+7. Copy the token and use: \`/settoken <paste_token_here>\`
+
+**Option 2: Use PowerShell**
+\`\`\`powershell
+# Install module if needed
+Install-Module Microsoft.Graph -Scope CurrentUser
+
+# Connect and get token
+Connect-MgGraph -Scopes "Mail.ReadWrite","Calendars.ReadWrite","Files.ReadWrite","User.Read"
+
+# Get the token (run after connecting)
+(Get-MgContext).AuthenticationProvider.GetTokenAsync()
+\`\`\`
+
+**Option 3: Request Admin Consent**
+Ask your IT administrator to:
+1. Go to Azure Portal → App Registrations → ${process.env.BOT_ID}
+2. API Permissions → "Grant admin consent for organization"
+
+After getting a token, use: \`/settoken <your_token>\`
+
+*Note: These are temporary testing solutions. Admin consent is needed for production use.*`);
+    
+  } catch (error) {
+    await context.sendActivity(`Get token error: ${error.message}`);
   }
 });
 
@@ -572,6 +831,85 @@ teamsBot.conversationUpdate("membersAdded", async (context, state) => {
 I'll automatically authenticate with your Microsoft 365 account when needed. No need to login first! ✨`;
   
   await context.sendActivity(welcomeMessage);
+});
+
+// Handle OAuth signin completion
+teamsBot.activity('signin/verifyState', async (context, state) => {
+  console.log('OAuth signin/verifyState received');
+  
+  try {
+    // Try our improved OAuth callback handler
+    const result = await teamsSSO.handleOAuthCallback(context);
+    
+    if (result.success) {
+      await context.sendActivity(result.message);
+    } else {
+      // Try the standard getUserToken as fallback
+      const tokenResponse = await getUserGraphToken(context);
+      
+      if (tokenResponse) {
+        await context.sendActivity('✅ **Successfully signed in to Microsoft 365!**\n\nYou can now ask me Microsoft 365 questions like:\n• "Check my calendar"\n• "Send an email to someone@company.com"\n• "Find files named report"');
+      } else {
+        await context.sendActivity('❌ Sign-in was not completed successfully. Please try again or use `/login` for more details.');
+      }
+    }
+  } catch (error) {
+    console.error('Error handling signin completion:', error);
+    await context.sendActivity('❌ There was an error completing the sign-in. Please try again or contact support.');
+  }
+});
+
+// Handle token response activities  
+teamsBot.activity('tokenResponse', async (context, state) => {
+  console.log('OAuth tokenResponse received');
+  console.log('Token response activity:', JSON.stringify(context.activity, null, 2));
+  
+  try {
+    // Try our improved OAuth callback handler
+    const result = await teamsSSO.handleOAuthCallback(context);
+    
+    if (result.success) {
+      await context.sendActivity(result.message);
+    } else if (context.activity.value && context.activity.value.token) {
+      // Manual token processing as fallback
+      const userAadObjectId = context.activity.from.aadObjectId;
+      const token = context.activity.value.token;
+      
+      // Validate and store the token
+      const userInfo = await teamsSSO.validateUserToken(userAadObjectId, token);
+      if (userInfo) {
+        tokenStorage.setToken(userAadObjectId, token);
+        await context.sendActivity(`✅ **Authentication successful!**\n\nWelcome ${userInfo.displayName}! You can now use Microsoft 365 features. Try asking: "check my calendar"!`);
+      } else {
+        await context.sendActivity('❌ Authentication failed - invalid token. Please try the sign-in process again.');
+      }
+    } else {
+      await context.sendActivity('❌ Authentication failed. Please try the sign-in process again.');
+    }
+  } catch (error) {
+    console.error('Error handling token response:', error);
+    await context.sendActivity('❌ Authentication failed due to an error. Please try again or contact support.');
+  }
+});
+
+// Handle token exchange activities (another OAuth callback type)
+teamsBot.activity('signin/tokenExchange', async (context, state) => {
+  console.log('OAuth signin/tokenExchange received');
+  console.log('Token exchange activity:', JSON.stringify(context.activity, null, 2));
+  
+  try {
+    // Try our improved OAuth callback handler
+    const result = await teamsSSO.handleOAuthCallback(context);
+    
+    if (result.success) {
+      await context.sendActivity(result.message);
+    } else {
+      await context.sendActivity('❌ Token exchange failed. Please try the sign-in process again.');
+    }
+  } catch (error) {
+    console.error('Error handling token exchange:', error);
+    await context.sendActivity('❌ Token exchange failed due to an error. Please try again.');
+  }
 });
 
 // Listen for ANY message to be received. MUST BE AFTER ANY OTHER MESSAGE HANDLERS
