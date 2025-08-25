@@ -48,20 +48,10 @@ expressApp.post("/api/messages", async (req, res) => {
   });
 });
 
-// Gracefully shutdown HTTP server and MCP connections
+// Gracefully shutdown HTTP server
 ["exit", "uncaughtException", "SIGINT", "SIGTERM", "SIGUSR1", "SIGUSR2"].forEach((event) => {
-  process.on(event, async () => {
+  process.on(event, () => {
     console.log(`Received ${event}, shutting down gracefully...`);
     server.close();
-    
-    // Cleanup MCP connections
-    try {
-      const { teamsBot } = require("./teamsBot");
-      if (teamsBot.mcpManager && teamsBot.mcpManager.cleanup) {
-        await teamsBot.mcpManager.cleanup();
-      }
-    } catch (error) {
-      console.error('Error during MCP cleanup:', error);
-    }
   });
 });

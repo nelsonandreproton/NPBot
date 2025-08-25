@@ -6,7 +6,8 @@ const {
   MemoryStorage,
 } = require("@microsoft/agents-hosting");
 const { version } = require("@microsoft/agents-hosting/package.json");
-const LazyMCPManager = require("./mcpManagerLazy");
+const MicrosoftGraphService = require("./microsoftGraphService");
+const TeamsSSO = require("./teamsSSO");
 
 const downloader = new AttachmentDownloader();
 
@@ -17,68 +18,80 @@ const teamsBot = new AgentApplication({
   fileDownloaders: [downloader],
 });
 
-// Initialize Lazy MCP Manager (no startup connection)
-const mcpManager = new LazyMCPManager();
-console.log('MCP Manager ready - servers will be connected on demand');
+// Initialize Microsoft Graph Service and Teams SSO
+const graphService = new MicrosoftGraphService();
+const teamsSSO = new TeamsSSO();
+console.log('Microsoft Graph Service ready - using Teams SSO authentication');
 
 async function processUserQuery(context, query) {
   console.log(`Processing query: ${query}`);
   
   let toolSelectionResponse = null;
+  const userId = context.activity.from.id;
   
   try {
-    // Step 1: Get available servers (without connecting)
-    const availableServers = mcpManager.getAvailableServers();
+    // Get available M365 tools
+    const m365Tools = graphService.getAvailableM365Tools();
     
-    if (availableServers.length > 0) {
-      // Step 2: Ask LLM to select which server to use
-      const serverSelectionResponse = await queryOllamaForServerSelection(query, availableServers);
+    // Try to get M365 token using Teams SSO
+    let userToken = null;
+    try {
+      userToken = await getUserGraphToken(context);
+    } catch (error) {
+      if (error.message === 'CONSENT_REQUIRED') {
+        console.log('User consent required for M365 access');
+      } else {
+        console.warn('Failed to get Graph token:', error.message);
+      }
+    }
+    
+    // Check if query requires M365 authentication
+    if (await requiresM365Authentication(query)) {
+      if (!userToken) {
+        await context.sendActivity('🔐 This action requires Microsoft 365 authentication. Please use /login command to authenticate.');
+        return;
+      }
       
-      if (serverSelectionResponse && serverSelectionResponse.useServer) {
-        console.log(`LLM selected server: ${serverSelectionResponse.serverName}`);
+      // Ask LLM to select M365 tool and extract parameters
+      toolSelectionResponse = await queryOllamaForM365ToolSelection(query, m365Tools);
+      
+      if (toolSelectionResponse && toolSelectionResponse.usesTool) {
+        console.log(`LLM selected M365 tool: ${toolSelectionResponse.toolName}`);
         
-        // Step 3: Connect to selected server and get its tools
-        const availableTools = await mcpManager.getToolsFromServer(serverSelectionResponse.serverName);
+        await context.sendActivity(`🔍 Using Microsoft 365 (${toolSelectionResponse.toolName})`);
         
-        // Step 4: Ask LLM to decide which tool to use from the selected server
-        toolSelectionResponse = await queryOllamaForToolSelection(query, availableTools);
-        
-        if (toolSelectionResponse && toolSelectionResponse.usesTool) {
-          console.log(`LLM selected: ${toolSelectionResponse.serverName}:${toolSelectionResponse.toolName}`);
-          
-          await context.sendActivity(`🔍 Using ${toolSelectionResponse.serverName} (${toolSelectionResponse.toolName})`);
-          
-          // Execute the MCP tool with LLM-extracted parameters
-          const result = await mcpManager.executeServerTool(
-            toolSelectionResponse.serverName,
+        // Execute M365 tool
+        try {
+          const result = await graphService.executeM365Tool(
+            userId,
+            userToken,
             toolSelectionResponse.toolName,
             toolSelectionResponse.parameters
           );
           
           // Format and send the result
-          const formattedResult = await formatMCPResultWithLLM(result, toolSelectionResponse.toolName, query);
-          
-          // Ensure we send a string, not an object or array
+          const formattedResult = await formatResultWithLLM(result, toolSelectionResponse.toolName, query);
           const resultText = typeof formattedResult === 'string' ? formattedResult : JSON.stringify(formattedResult);
           await context.sendActivity(resultText);
           return;
+        } catch (error) {
+          if (error.message === 'CONSENT_REQUIRED') {
+            await context.sendActivity({
+              type: 'message',
+              attachments: [{
+                contentType: 'application/vnd.microsoft.card.adaptive',
+                content: teamsSSO.createConsentCard()
+              }]
+            });
+            return;
+          }
+          throw error;
         }
-      } else {
-        console.log('LLM decided not to use any server for this query');
       }
-    } else {
-      console.log('No MCP servers available');
     }
   } catch (error) {
-    console.error('MCP tool selection/execution failed:', error);
-    
-    // Improved error handling
-    if (toolSelectionResponse && toolSelectionResponse.serverName && 
-        (error.message.includes('timeout') || error.message.includes('connect'))) {
-      await context.sendActivity(`⚠️ The ${toolSelectionResponse.serverName} is temporarily unavailable (${error.message}). Falling back to direct LLM response...`);
-    } else {
-      await context.sendActivity('❌ MCP tool execution failed. Using direct LLM response...');
-    }
+    console.error('M365 tool execution failed:', error);
+    await context.sendActivity('❌ Microsoft 365 tool execution failed. Using direct LLM response...');
   }
   
   // Fallback to direct LLM response
@@ -92,28 +105,98 @@ async function processUserQuery(context, query) {
   }
 }
 
-async function queryOllamaForServerSelection(query, availableServers) {
-  const serverSelectionPrompt = `You are a server selection assistant. Given a user query and a list of available MCP servers, determine which server should be used.
+// Helper functions for user authentication and M365 detection
+const userTokens = new Map(); // Simple in-memory storage (use database in production)
+
+function getUserToken(userId) {
+  return userTokens.get(userId);
+}
+
+async function getUserGraphToken(context) {
+  const userId = context.activity.from.id;
+  
+  // Check if we already have a cached token
+  let token = getUserToken(userId);
+  if (token) {
+    // Validate the token
+    const isValid = await teamsSSO.validateUserToken(userId, token);
+    if (isValid) {
+      return token;
+    } else {
+      // Token expired, remove it
+      clearUserToken(userId);
+    }
+  }
+  
+  try {
+    // Get new token using Teams SSO
+    token = await teamsSSO.getGraphTokenFromTeamsSSO(context);
+    if (token) {
+      setUserToken(userId, token);
+      return token;
+    }
+  } catch (error) {
+    console.error('Teams SSO failed:', error);
+    
+    // Check if it's a consent issue
+    if (error.message.includes('consent')) {
+      throw new Error('CONSENT_REQUIRED');
+    }
+    
+    throw error;
+  }
+  
+  return null;
+}
+
+function setUserToken(userId, token) {
+  userTokens.set(userId, token);
+}
+
+function clearUserToken(userId) {
+  userTokens.delete(userId);
+}
+
+async function requiresM365Authentication(query) {
+  // Simple keyword detection - could be enhanced with LLM analysis
+  const m365Keywords = [
+    'email', 'send email', 'inbox', 'calendar', 'schedule', 'meeting', 
+    'onedrive', 'files', 'documents', 'create file', 'search files'
+  ];
+  
+  const queryLower = query.toLowerCase();
+  return m365Keywords.some(keyword => queryLower.includes(keyword));
+}
+
+async function queryOllamaForM365ToolSelection(query, availableTools) {
+  const toolSelectionPrompt = `You are a Microsoft 365 tool selection assistant. Given a user query and available Microsoft 365 tools, determine which tool should be used and extract the necessary parameters.
 
 User Query: "${query}"
 
-Available Servers:
-${JSON.stringify(availableServers, null, 2)}
+Available Microsoft 365 Tools:
+${JSON.stringify(availableTools, null, 2)}
 
 Instructions:
-1. Analyze the user query to determine which server best matches the user's intent
-2. If a server matches, respond with JSON: {"useServer": true, "serverName": "server_name"}
-3. If no server matches, respond with JSON: {"useServer": false}
-4. Base your decision on the server descriptions and the user's query
-5. IMPORTANT: Return ONLY valid JSON, no other text before or after
+1. Carefully analyze the user query against each tool's name and description
+2. If a tool matches the user's intent, respond with JSON: {"usesTool": true, "toolName": "tool_name", "parameters": {...}}
+3. If no tool matches, respond with JSON: {"usesTool": false}
+4. Extract parameters based on the tool's parameter schema:
+   - For emails: extract recipients, subject, and body content from the query
+   - For calendar: extract dates, times, attendees, and event details
+   - For files: extract file names, search terms, or content to create/find
+5. Use your knowledge to convert user-friendly terms to technical parameters
+6. For dates/times, convert to ISO 8601 format when possible
+7. IMPORTANT: Only include parameters that are actually defined in the tool's parameter schema
+8. IMPORTANT: The "parameters" field should contain actual values, NOT the schema definition
+9. IMPORTANT: Return ONLY valid JSON, no other text before or after
 
 JSON Response:`;
 
   try {
-    const response = await queryOllama(serverSelectionPrompt);
-    console.log('LLM server selection response:', response);
+    const response = await queryOllama(toolSelectionPrompt);
+    console.log('LLM M365 tool selection response:', response);
     
-    // Clean and parse JSON response (similar to tool selection)
+    // Clean the response to extract just the JSON part
     let cleanedResponse = response.trim();
     cleanedResponse = cleanedResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '');
     
@@ -122,137 +205,27 @@ JSON Response:`;
     
     if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
       const jsonString = cleanedResponse.substring(firstBrace, lastBrace + 1);
-      console.log('Extracted server selection JSON:', jsonString);
+      console.log('Extracted M365 tool selection JSON:', jsonString);
       
       try {
         const parsed = JSON.parse(jsonString);
-        console.log('Successfully parsed server selection:', parsed);
+        console.log('Successfully parsed M365 tool selection:', parsed);
         return parsed;
       } catch (parseError) {
-        console.error('Server selection JSON parse error:', parseError);
+        console.error('M365 tool selection JSON parse error:', parseError);
       }
     }
     
-    console.warn('No valid JSON found in server selection response, falling back to no server');
-    return { useServer: false };
-    
-  } catch (error) {
-    console.error('Server selection error:', error);
-    return { useServer: false };
-  }
-}
-
-async function queryOllamaForToolSelection(query, availableTools) {
-  const toolSelectionPrompt = `You are a tool selection assistant. Given a user query and a list of available tools, determine if any tool should be used and extract the necessary parameters.
-
-User Query: "${query}"
-
-Available Tools:
-${JSON.stringify(availableTools, null, 2)}
-
-Instructions:
-1. Carefully analyze the user query against each tool's name and description
-2. If a tool's description matches the user's intent, respond with JSON: {"usesTool": true, "serverName": "server_name", "toolName": "tool_name", "parameters": {...}}
-3. If no tool matches, respond with JSON: {"usesTool": false}
-4. Extract parameters based on the tool's parameter schema:
-   - If the tool's parameters.properties is empty {}, use empty object: "parameters": {}
-   - If the tool requires specific parameters, extract them from the user query
-   - For coordinates: extract or estimate latitude/longitude from location names
-   - For state codes: convert city/location names to appropriate state codes
-   - For dates: extract or infer dates from the query
-5. Use your knowledge to convert user-friendly terms to technical parameters when needed
-6. IMPORTANT: Only include parameters that are actually defined in the tool's parameter schema
-7. IMPORTANT: The "parameters" field should contain actual values, NOT the schema definition itself
-8. IMPORTANT: Return ONLY valid JSON, no other text before or after
-
-JSON Response:`;
-
-  try {
-    const response = await queryOllama(toolSelectionPrompt);
-    console.log('LLM tool selection response:', response);
-    
-    // Clean the response to extract just the JSON part
-    let cleanedResponse = response.trim();
-    
-    // Remove any markdown code block markers
-    cleanedResponse = cleanedResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '');
-    
-    // Find the JSON object - look for the first { and last }
-    const firstBrace = cleanedResponse.indexOf('{');
-    const lastBrace = cleanedResponse.lastIndexOf('}');
-    
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      let jsonString = cleanedResponse.substring(firstBrace, lastBrace + 1);
-      
-      // Fix common malformed JSON issues from LLM
-      jsonString = jsonString.replace('"parameters": {"}}', '"parameters": {}}');
-      jsonString = jsonString.replace('"parameters": {"}', '"parameters": {}}');
-      jsonString = jsonString.replace('"parameters": {"}"', '"parameters": {}}');
-      
-      // Handle cases where closing brace is missing
-      if (jsonString.endsWith('"parameters": {}')) {
-        jsonString += '}';
-      }
-      
-      // Remove extra characters after the JSON
-      if (jsonString.includes('"}')) {
-        const validEnd = jsonString.lastIndexOf('}}');
-        if (validEnd !== -1) {
-          jsonString = jsonString.substring(0, validEnd + 2);
-        }
-      }
-      
-      console.log('Extracted JSON string:', jsonString);
-      
-      try {
-        const parsed = JSON.parse(jsonString);
-        console.log('Successfully parsed tool selection:', parsed);
-        
-        // Validate that parameters is actually parameters, not schema
-        if (parsed.usesTool && parsed.parameters) {
-          // If parameters looks like a schema definition, replace with empty object
-          if (parsed.parameters.type === 'object' && parsed.parameters.properties !== undefined) {
-            console.warn('LLM returned schema instead of parameters, correcting to empty object');
-            parsed.parameters = {};
-          }
-          
-          // Find the selected tool to check if it actually needs parameters
-          const selectedTool = availableTools.find(t => 
-            t.serverName === parsed.serverName && t.toolName === parsed.toolName
-          );
-          
-          if (selectedTool && selectedTool.parameters && 
-              selectedTool.parameters.type === 'object' && 
-              Object.keys(selectedTool.parameters.properties || {}).length === 0) {
-            // Tool has no parameters, so use empty object
-            console.log('Tool requires no parameters, using empty object');
-            parsed.parameters = {};
-          }
-        }
-        
-        return parsed;
-      } catch (parseError) {
-        console.error('JSON parse error:', parseError);
-        console.error('Failed to parse:', jsonString);
-      }
-    }
-    
-    // Fallback: try the original regex approach
-    const jsonMatch = response.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    
-    console.warn('No valid JSON found in LLM response, falling back to no tool');
+    console.warn('No valid JSON found in M365 tool selection response');
     return { usesTool: false };
     
   } catch (error) {
-    console.error('Tool selection error:', error);
+    console.error('M365 tool selection error:', error);
     return { usesTool: false };
   }
 }
 
-async function formatMCPResultWithLLM(result, toolName, originalQuery) {
+async function formatResultWithLLM(result, toolName, originalQuery) {
   if (!result) {
     return 'No result returned from the service.';
   }
@@ -263,21 +236,10 @@ async function formatMCPResultWithLLM(result, toolName, originalQuery) {
   
   // Handle MCP result structure with content array
   if (result.content && Array.isArray(result.content)) {
-    // Extract text from the first content item
     const firstContent = result.content[0];
     if (firstContent && firstContent.type === 'text' && firstContent.text) {
       return firstContent.text;
     }
-  }
-  
-  // Handle structured content
-  if (result.structuredContent && result.structuredContent.result) {
-    return result.structuredContent.result;
-  }
-  
-  // Handle direct content
-  if (result.content && typeof result.content === 'string') {
-    return result.content;
   }
   
   // Use LLM to format the result dynamically
@@ -291,13 +253,11 @@ Instructions:
 1. Format the result in a clear, human-readable way suitable for Microsoft Teams
 2. If it's a JSON list/array of objects, format it as a readable table or list
 3. Use appropriate emojis and markdown formatting (tables, bullet points, etc.)
-4. For employee data, create a clean table with requested columns
-5. For weather data, present temperature, conditions, and alerts clearly
-6. Convert technical data to user-friendly language
-7. Convert units to metric system (Celsius, km/h, km) for European users when possible
-8. If the result contains error information, present it clearly
-9. Keep the response well-structured and easy to scan
-10. Don't include raw JSON - make it human-readable
+4. For email/calendar/file operations, present the information clearly
+5. Convert technical data to user-friendly language
+6. If the result contains error information, present it clearly
+7. Keep the response well-structured and easy to scan
+8. Don't include raw JSON - make it human-readable
 
 Format the result:`;
 
@@ -310,6 +270,8 @@ Format the result:`;
     return `📋 **${toolName} Result**\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
   }
 }
+
+
 
 /**
  * Helper: Extract user input - handle @np mentions and direct bot conversations
@@ -414,29 +376,155 @@ teamsBot.message("/runtime", async (context, state) => {
   await context.sendActivity(JSON.stringify(runtime));
 });
 
-teamsBot.message("/mcp", async (context, state) => {
+
+teamsBot.message("/login", async (context, state) => {
+  const userId = context.activity.from.id;
+  
   try {
-    const serverSummary = mcpManager.getServerSummary();
+    // Try to get token using Teams SSO
+    const token = await getUserGraphToken(context);
     
-    if (serverSummary.totalServers === 0) {
-      await context.sendActivity("**MCP Server Status**\n\nNo servers currently connected. Servers are loaded on-demand when needed.");
-      return;
+    if (token) {
+      // Test the token by getting user profile
+      const profile = await graphService.executeM365Tool(userId, token, 'get_user_profile', {});
+      await context.sendActivity(`✅ **Successfully authenticated via Teams SSO!**
+
+**Welcome, ${profile.displayName}** (${profile.mail})
+
+🟢 **Status:** Ready to use Microsoft 365 features
+📧 Send/read emails
+📅 Manage calendar events  
+📁 Access OneDrive files
+👤 Access profile information
+
+You can now ask me things like:
+• "send an email to john@company.com"
+• "check my calendar for tomorrow"  
+• "find files named report"`);
     }
-    
-    let response = `**MCP Server Status** (${serverSummary.totalServers} connected servers)\n\n`;
-    
-    for (const server of serverSummary.servers) {
-      response += `**${server.name}** ✅ Connected (${server.toolCount} tools)\n`;
-      for (const tool of server.tools) {
-        response += `  • \`${tool.name}\`: ${tool.description}\n`;
-      }
-      response += '\n';
-    }
-    
-    await context.sendActivity(response);
   } catch (error) {
-    await context.sendActivity("Error checking MCP server status: " + error.message);
+    if (error.message === 'CONSENT_REQUIRED') {
+      await context.sendActivity({
+        type: 'message',
+        text: '🔐 **Microsoft 365 Authentication Required**\n\nYour Teams session is active, but additional permissions are needed for Microsoft 365 features.',
+        attachments: [{
+          contentType: 'application/vnd.microsoft.card.adaptive',
+          content: teamsSSO.createConsentCard()
+        }]
+      });
+    } else {
+      await context.sendActivity(`❌ **Authentication Failed**
+
+Error: ${error.message}
+
+This might be due to:
+• Bot not properly configured for Teams SSO
+• Missing Azure AD app permissions
+• User not properly authenticated in Teams
+
+**Administrator Setup Required:**
+1. Configure Azure AD app with Microsoft Graph permissions
+2. Enable Teams SSO in bot configuration
+3. Required scopes: Mail.ReadWrite, Calendars.ReadWrite, Files.ReadWrite, User.Read
+
+For manual testing, you can use: \`/settoken <your_access_token>\``);
+    }
   }
+});
+
+teamsBot.message("/consent", async (context, state) => {
+  await context.sendActivity({
+    type: 'message',
+    text: '🔐 **Grant Microsoft 365 Permissions**\n\nClick the button below to grant permissions for Microsoft 365 features:',
+    attachments: [{
+      contentType: 'application/vnd.microsoft.card.adaptive',
+      content: teamsSSO.createConsentCard()
+    }]
+  });
+});
+
+teamsBot.message("/logout", async (context, state) => {
+  const userId = context.activity.from.id;
+  clearUserToken(userId);
+  graphService.clearUserTokens(userId);
+  
+  await context.sendActivity("🔓 Successfully logged out from Microsoft 365. You can log back in using /login command.");
+});
+
+teamsBot.message("/settoken", async (context, state) => {
+  const userId = context.activity.from.id;
+  const text = context.activity.text || '';
+  const tokenMatch = text.match(/\/settoken\s+(.+)/);
+  
+  if (!tokenMatch) {
+    await context.sendActivity("Usage: `/settoken <your_access_token>`\n\nThis is for testing purposes only. In production, use proper OAuth flow.");
+    return;
+  }
+  
+  const token = tokenMatch[1].trim();
+  setUserToken(userId, token);
+  
+  try {
+    // Test the token by getting user profile
+    const profile = await graphService.executeM365Tool(userId, token, 'get_user_profile', {});
+    await context.sendActivity(`✅ Token set successfully!\n\n**Welcome, ${profile.displayName}** (${profile.mail})\n\nYou can now use Microsoft 365 features like:\n- Send/read emails\n- Manage calendar\n- Access OneDrive files`);
+  } catch (error) {
+    clearUserToken(userId);
+    await context.sendActivity(`❌ Invalid token or insufficient permissions.\n\nError: ${error.message}\n\nPlease ensure your token has the required scopes: Mail.ReadWrite, Calendars.ReadWrite, Files.ReadWrite, User.Read`);
+  }
+});
+
+teamsBot.message("/m365", async (context, state) => {
+  const userId = context.activity.from.id;
+  
+  let response = `**Microsoft 365 Integration Status**\n\n`;
+  
+  try {
+    const token = await getUserGraphToken(context);
+    
+    if (token) {
+      // Get user info to show authentication status
+      const profile = await graphService.executeM365Tool(userId, token, 'get_user_profile', {});
+      
+      response += `🟢 **Status:** Authenticated via Teams SSO\n`;
+      response += `👤 **User:** ${profile.displayName} (${profile.mail})\n\n`;
+      response += `**Available Tools:**\n`;
+      
+      const m365Tools = graphService.getAvailableM365Tools();
+      for (const tool of m365Tools) {
+        response += `• \`${tool.name}\`: ${tool.description}\n`;
+      }
+      
+      response += `\n**Usage:**\n`;
+      response += `• Just ask me naturally: "send email", "check calendar", "find files", etc.\n`;
+      response += `• Use \`/logout\` to sign out`;
+    } else {
+      response += `🔴 **Status:** Not authenticated\n\n`;
+      response += `**Teams SSO Integration:** Ready\n`;
+      response += `**Required:** Microsoft Graph permissions\n\n`;
+      response += `**To get started:**\n`;
+      response += `• Use \`/login\` to authenticate via Teams SSO\n`;
+      response += `• Use \`/consent\` if permissions needed\n`;
+      response += `• Use \`/settoken <token>\` for manual testing`;
+    }
+  } catch (error) {
+    response += `⚠️ **Status:** Authentication Error\n\n`;
+    response += `**Error:** ${error.message}\n\n`;
+    
+    const userInfo = teamsSSO.getUserInfoFromTeamsContext(context);
+    if (userInfo.aadObjectId) {
+      response += `**Teams User:** ${userInfo.name} (${userInfo.userPrincipalName})\n`;
+      response += `**AAD Object ID:** ${userInfo.aadObjectId}\n\n`;
+      response += `**Next Steps:**\n`;
+      response += `• Use \`/consent\` to grant permissions\n`;
+      response += `• Contact admin if SSO setup is incomplete`;
+    } else {
+      response += `**Issue:** Teams identity information not available\n`;
+      response += `**Required:** Bot must have "identity" permission in manifest`;
+    }
+  }
+  
+  await context.sendActivity(response);
 });
 
 teamsBot.conversationUpdate("membersAdded", async (context, state) => {

@@ -1,49 +1,87 @@
-# Overview of the Basic Bot template
+# Near Partner AI Assistant
 
-Examples of Microsoft Teams bots in everyday use include:
+An intelligent Microsoft Teams bot that provides seamless access to Microsoft 365 services through natural language interactions. The bot uses Teams Single Sign-On (SSO) to impersonate users and access their personal data with their own permissions.
 
-- Bots that notify about build failures.
-- Bots that provide information about the weather or bus schedules.
-- Bots that provide travel information.
+## Features
 
-A bot interaction can be a quick question and answer, or it can be a complex conversation. Being a cloud application, a bot can provide valuable and secure access to cloud services and corporate resources.
+- **Microsoft 365 Integration**: Access email, calendar, and OneDrive with user's permissions
+- **Teams SSO Authentication**: Leverages existing Teams login - no separate authentication needed
+- **Natural Language Processing**: Understands user intent and selects appropriate Microsoft 365 tools
+- **LLM-Powered Responses**: Uses Ollama for intelligent query processing and result formatting
 
-## Get started with the Basic Bot template
+## Supported Microsoft 365 Operations
 
-> **Prerequisites**
->
-> To run the Basic Bot template in your local dev machine, you will need:
->
-> - [Node.js](https://nodejs.org/), supported versions: 18, 20, 22
-> - [Microsoft 365 Agents Toolkit Visual Studio Code Extension](https://aka.ms/teams-toolkit) version 5.0.0 and higher or [Microsoft 365 Agents Toolkit CLI](https://aka.ms/teamsfx-toolkit-cli)
+- 📧 **Email**: Send emails, read inbox, search messages
+- 📅 **Calendar**: View events, create meetings, check availability  
+- 📁 **OneDrive**: Search files, read content, create documents
+- 👤 **Profile**: Access user information
 
-> For local debugging using Microsoft 365 Agents Toolkit CLI, you need to do some extra steps described in [Set up your Microsoft 365 Agents Toolkit CLI for local debugging](https://aka.ms/teamsfx-cli-debugging).
+## Setup and Configuration
 
-1. First, select the Microsoft 365 Agents Toolkit icon on the left in the VS Code toolbar.
-2. Press F5 to start debugging which launches your app in Microsoft 365 Agents Playground using a web browser. Select `Debug in Microsoft 365 Agents Playground`.
-3. The browser will pop up to open Microsoft 365 Agents Playground.
-4. You will receive a welcome message from the bot, and you can send anything to the bot to get an echoed response.
+### Prerequisites
 
-**Congratulations**! You are running an application that can now interact with users in Microsoft 365 Agents Playground:
+- [Node.js](https://nodejs.org/) (versions 18, 20, or 22)
+- [Microsoft 365 Agents Toolkit](https://aka.ms/teams-toolkit) or CLI
+- Ollama running with a compatible model (e.g., gemma2:2b)
+- Azure AD app registration with Microsoft Graph permissions
 
-![basic bot](./img/echo-bot.png)
+### Environment Variables
+
+Create a `.env` file with:
+
+```bash
+BOT_ID=your-azure-ad-app-id
+BOT_PASSWORD=your-azure-ad-app-secret  
+TENANT_ID=your-tenant-id
+OLLAMA_URL=http://localhost:11434
+```
+
+### Azure AD App Configuration
+
+1. Register an Azure AD application
+2. Add Microsoft Graph API permissions:
+   - `Mail.ReadWrite`
+   - `Calendars.ReadWrite` 
+   - `Files.ReadWrite`
+   - `User.Read`
+3. Grant admin consent for the permissions
+4. Configure `api://your-domain/your-app-id` as the Application ID URI
+
+### Running the Bot
+
+```bash
+npm install
+npm start
+```
+
+### Using the Bot
+
+1. Install the bot in Microsoft Teams
+2. Use `/login` to authenticate via Teams SSO
+3. Ask natural language questions like:
+   - "Send an email to john@company.com about the meeting"
+   - "What's on my calendar tomorrow?"
+   - "Find files named 'report' in my OneDrive"
 
 
-## What's included in the template
+## Available Commands
 
-| Folder       | Contents                                            |
+- `/login` - Authenticate via Teams SSO and test Microsoft 365 access
+- `/logout` - Clear authentication tokens  
+- `/consent` - Grant Microsoft 365 permissions if needed
+- `/m365` - Check Microsoft 365 integration status
+- `/settoken <token>` - Manually set access token for testing
+
+## Project Structure
+
+| File/Folder | Contents |
 | - | - |
-| `.vscode`    | VSCode files for debugging                          |
-| `appPackage` | Templates for the application manifest        |
-| `env`        | Environment files                                   |
-| `infra`      | Templates for provisioning Azure resources          |
-
-The following files can be customized and demonstrate an example implementation to get you started.
-
-| File                                 | Contents                                           |
-| - | - |
-|`teamsBot.js`| Handles business logics for the echo bot.|
-|`index.js`|`index.js` is used to setup and configure the echo bot.|
+| `teamsBot.js` | Main bot logic, LLM integration, and M365 tool execution |
+| `microsoftGraphService.js` | Microsoft Graph API wrapper with user impersonation |  
+| `teamsSSO.js` | Teams Single Sign-On implementation |
+| `index.js` | Express server setup and bot initialization |
+| `appPackage/` | Teams app manifest and icons |
+| `infra/` | Azure deployment templates |
 
 The following are Microsoft 365 Agents Toolkit specific project files. You can [visit a complete guide on Github](https://github.com/OfficeDev/TeamsFx/wiki/Teams-Toolkit-Visual-Studio-Code-v5-Guide#overview) to understand how Microsoft 365 Agents Toolkit works.
 

@@ -4,7 +4,7 @@
     "msteams": {
         "teamsAppId": null
     },
-    "description": "Microsoft 365 Agents Toolkit echo bot sample",
+    "description": "Near Partner AI Assistant with Microsoft 365 integration",
     "engines": {
         "node": "18 || 20 || 22"
     },
@@ -21,8 +21,9 @@
         "test": "echo \"Error: no test specified\" && exit 1"
     },
     "dependencies": {
+        "@azure/msal-node": "^3.7.2",
         "@microsoft/agents-hosting": "^0.2.14",
-        "@modelcontextprotocol/sdk": "^1.17.4",
+        "@microsoft/microsoft-graph-client": "^3.0.7",
         "dotenv": "^17.2.1",
         "express": "^5.0.1",
         "node-fetch": "^3.3.2"
