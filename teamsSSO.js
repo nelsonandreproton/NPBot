@@ -207,39 +207,48 @@ class TeamsSSO {
   }
 
   /**
-   * Create a Hero Card with direct Azure AD OAuth URL (bypasses Bot Framework OAuth connection issues)
+   * Create Bot Framework OAuth Card with proper session handling
    */
   createConsentMessage() {
-    // Generate direct Azure AD OAuth URL
-    const redirectUri = encodeURIComponent('https://token.botframework.com/.auth/web/redirect');
-    const scopes = encodeURIComponent('https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Files.ReadWrite https://graph.microsoft.com/User.Read offline_access');
-    const state = encodeURIComponent(`MicrosoftGraph-${Date.now()}`);
-    
-    const authUrl = `https://login.microsoftonline.com/${process.env.TENANT_ID}/oauth2/v2.0/authorize?` +
-      `client_id=${process.env.BOT_ID}&` +
-      `response_type=code&` +
-      `redirect_uri=${redirectUri}&` +
-      `response_mode=query&` +
-      `scope=${scopes}&` +
-      `state=${state}&` +
-      `prompt=consent`;
-
     return {
       type: 'message',
       attachments: [{
-        contentType: 'application/vnd.microsoft.card.hero',
+        contentType: 'application/vnd.microsoft.card.adaptive',
         content: {
-          title: '🔐 Microsoft 365 Authentication Required',
-          subtitle: 'Sign in to access your emails, calendar, and files',
-          text: `**Permissions needed:**\n📧 Mail.ReadWrite - Send and read emails\n📅 Calendars.ReadWrite - Manage calendar events\n📁 Files.ReadWrite - Access OneDrive files\n👤 User.Read - Profile information\n\n*One-time setup - you won't need to sign in again.*`,
-          images: [{
-            url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Microsoft_logo.svg/512px-Microsoft_logo.svg.png'
-          }],
-          buttons: [{
-            type: 'openUrl',
-            title: '🔗 Sign In to Microsoft 365',
-            value: authUrl
-          }]
+          $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+          type: 'AdaptiveCard',
+          version: '1.4',
+          body: [
+            {
+              type: 'TextBlock',
+              text: '🔐 Microsoft 365 Authentication Required',
+              size: 'Large',
+              weight: 'Bolder'
+            },
+            {
+              type: 'TextBlock',
+              text: 'To use Microsoft 365 features, you need to authenticate first.',
+              wrap: true
+            },
+            {
+              type: 'TextBlock',
+              text: '**Required permissions:**\n📧 Mail.Read + Mail.Send\n📅 Calendars.ReadWrite\n📁 Files.ReadWrite.All\n👤 User.Read',
+              wrap: true,
+              spacing: 'Medium'
+            },
+            {
+              type: 'TextBlock',
+              text: '**Option 1: Use /settoken command**\nGet a token from [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer) and use `/settoken <your_token>`',
+              wrap: true,
+              spacing: 'Medium'
+            },
+            {
+              type: 'TextBlock',
+              text: '**Option 2: Contact your administrator**\nAsk your IT admin to configure the bot\'s OAuth connection in Azure Bot Service.',
+              wrap: true,
+              spacing: 'Small'
+            }
+          ]
         }
       }]
     };
@@ -259,7 +268,7 @@ class TeamsSSO {
         content: {
           title: '🔐 Microsoft 365 Authentication Required',
           subtitle: 'Sign in to access your emails, calendar, and files',
-          text: `**Permissions needed:**\n📧 Mail.ReadWrite - Send and read emails\n📅 Calendars.ReadWrite - Manage calendar events\n📁 Files.ReadWrite - Access OneDrive files\n👤 User.Read - Profile information\n\n*One-time setup - you won't need to sign in again.*`,
+          text: `**Permissions needed:**\n📧 Mail.Read + Mail.Send - Send and read emails\n📅 Calendars.ReadWrite - Manage calendar events\n📁 Files.ReadWrite.All - Access OneDrive files\n👤 User.Read - Profile information\n\n*One-time setup - you won't need to sign in again.*`,
           images: [{
             url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Microsoft_logo.svg/512px-Microsoft_logo.svg.png'
           }],
@@ -331,7 +340,7 @@ For individual user consent, you need to:
 3. Use the proper OAuth flow
 
 **Required permissions:**
-📧 Mail.ReadWrite, 📅 Calendars.ReadWrite, 📁 Files.ReadWrite, 👤 User.Read`;
+📧 Mail.Read + Mail.Send, 📅 Calendars.ReadWrite, 📁 Files.ReadWrite.All, 👤 User.Read`;
   }
 
   /**

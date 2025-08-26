@@ -27,20 +27,18 @@ console.log('Microsoft Graph Service ready - using Teams SSO authentication');
 async function processUserQuery(context, query) {
   console.log(`Processing query: ${query}`);
   
-  let toolSelectionResponse = null;
   const userId = context.activity.from.id;
   
   try {
-    // Only try M365 authentication if it's actually needed
-    const needsAuth = await requiresM365Authentication(query);
-    console.log(`Query: "${query}" - Needs M365 auth: ${needsAuth}`);
+    // Use LLM to intelligently determine M365 tool needs
+    const m365Tools = graphService.getAvailableM365Tools();
+    const toolSelectionResponse = await queryOllamaForM365ToolSelection(query, m365Tools);
     
-    if (!needsAuth) {
+    if (!toolSelectionResponse.usesTool) {
       // Skip M365 entirely for non-M365 queries
-      console.log('Skipping M365 authentication - not needed for this query');
+      console.log('LLM determined no M365 tools needed for this query');
     } else {
-      // Get available M365 tools
-      const m365Tools = graphService.getAvailableM365Tools();
+      console.log(`LLM selected M365 tool: ${toolSelectionResponse.toolName}`);
       
       // Try to get M365 token using Teams SSO
       let userToken = null;
@@ -80,40 +78,33 @@ async function processUserQuery(context, query) {
       }
       
       if (userToken) {
-        // Ask LLM to select M365 tool and extract parameters
-        toolSelectionResponse = await queryOllamaForM365ToolSelection(query, m365Tools);
+        await context.sendActivity(`🔍 Using Microsoft 365 (${toolSelectionResponse.toolName})`);
         
-        if (toolSelectionResponse && toolSelectionResponse.usesTool) {
-          console.log(`LLM selected M365 tool: ${toolSelectionResponse.toolName}`);
+        // Execute M365 tool
+        try {
+          const result = await graphService.executeM365Tool(
+            userId,
+            userToken,
+            toolSelectionResponse.toolName,
+            toolSelectionResponse.parameters
+          );
           
-          await context.sendActivity(`🔍 Using Microsoft 365 (${toolSelectionResponse.toolName})`);
-          
-          // Execute M365 tool
-          try {
-            const result = await graphService.executeM365Tool(
-              userId,
-              userToken,
-              toolSelectionResponse.toolName,
-              toolSelectionResponse.parameters
-            );
-            
-            // Format and send the result
-            const formattedResult = await formatResultWithLLM(result, toolSelectionResponse.toolName, query);
-            const resultText = typeof formattedResult === 'string' ? formattedResult : JSON.stringify(formattedResult);
-            await context.sendActivity(resultText);
+          // Format and send the result
+          const formattedResult = await formatResultWithLLM(result, toolSelectionResponse.toolName, query);
+          const resultText = typeof formattedResult === 'string' ? formattedResult : JSON.stringify(formattedResult);
+          await context.sendActivity(resultText);
+          return;
+        } catch (error) {
+          if (error.message === 'CONSENT_REQUIRED') {
+            // Use OAuth Card for best Teams integration
+            console.log('🔐 Sending OAuth card for M365 tool execution');
+            const oauthCard = teamsSSO.createConsentMessage();
+            console.log('OAuth card content:', JSON.stringify(oauthCard, null, 2));
+            await context.sendActivity(oauthCard);
+            console.log('✅ OAuth card sent successfully');
             return;
-          } catch (error) {
-            if (error.message === 'CONSENT_REQUIRED') {
-              // Use OAuth Card for best Teams integration
-              console.log('🔐 Sending OAuth card for M365 tool execution');
-              const oauthCard = teamsSSO.createConsentMessage();
-              console.log('OAuth card content:', JSON.stringify(oauthCard, null, 2));
-              await context.sendActivity(oauthCard);
-              console.log('✅ OAuth card sent successfully');
-              return;
-            }
-            throw error;
           }
+          throw error;
         }
       }
     }
@@ -207,31 +198,22 @@ function clearUserToken(userId) {
   userTokens.delete(userId);
 }
 
-async function requiresM365Authentication(query) {
-  // Don't require auth for bot commands
-  if (query.startsWith('/')) {
-    return false;
-  }
-  
-  // Comprehensive keyword detection for Microsoft 365 services
-  const m365Keywords = [
-    // Email
-    'email', 'send email', 'mail', 'inbox', 'message', 'reply', 'forward',
-    // Calendar  
-    'calendar', 'schedule', 'meeting', 'appointment', 'event', 'available', 'busy',
-    // OneDrive/Files
-    'onedrive', 'files', 'documents', 'create file', 'search files', 'find file',
-    'document', 'spreadsheet', 'presentation', 'word', 'excel', 'powerpoint',
-    // General M365
-    'microsoft 365', 'm365', 'office 365', 'outlook', 'teams files'
-  ];
-  
-  const queryLower = query.toLowerCase();
-  return m365Keywords.some(keyword => queryLower.includes(keyword));
-}
 
 async function queryOllamaForM365ToolSelection(query, availableTools) {
+  // Get current date/time information for context
+  const now = new Date();
+  const currentDateTime = now.toISOString();
+  const currentLocalTime = now.toLocaleString();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const weekday = now.toLocaleDateString('en-US', { weekday: 'long' });
+  
   const toolSelectionPrompt = `You are a Microsoft 365 tool selection assistant. Given a user query and available Microsoft 365 tools, determine which tool should be used and extract the necessary parameters.
+
+**Current Context:**
+- Current Date/Time (UTC): ${currentDateTime}
+- Current Local Time: ${currentLocalTime}
+- Timezone: ${timezone}
+- Day of Week: ${weekday}
 
 User Query: "${query}"
 
@@ -244,10 +226,15 @@ Instructions:
 3. If no tool matches, respond with JSON: {"usesTool": false}
 4. Extract parameters based on the tool's parameter schema:
    - For emails: extract recipients, subject, and body content from the query
-   - For calendar: extract dates, times, attendees, and event details
+   - For calendar: extract dates, times, attendees, and event details using the current context
    - For files: extract file names, search terms, or content to create/find
-5. Use your knowledge to convert user-friendly terms to technical parameters
-6. For dates/times, convert to ISO 8601 format when possible
+5. **IMPORTANT - Time Context Usage:**
+   - Use the current date/time context to interpret relative time references
+   - "today" = current date, "tomorrow" = next day, "this week" = current week
+   - "next Monday" = calculate from current date and weekday
+   - Convert all dates/times to ISO 8601 format (YYYY-MM-DDTHH:MM:SS.sssZ)
+   - Use the current timezone information for accurate time calculations
+6. Use your knowledge to convert user-friendly terms to technical parameters
 7. IMPORTANT: Only include parameters that are actually defined in the tool's parameter schema
 8. IMPORTANT: The "parameters" field should contain actual values, NOT the schema definition
 9. IMPORTANT: Return ONLY valid JSON, no other text before or after
@@ -304,8 +291,21 @@ async function formatResultWithLLM(result, toolName, originalQuery) {
     }
   }
   
+  // Get current date/time information for context
+  const now = new Date();
+  const currentDateTime = now.toISOString();
+  const currentLocalTime = now.toLocaleString();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const weekday = now.toLocaleDateString('en-US', { weekday: 'long' });
+  
   // Use LLM to format the result dynamically
   const formatPrompt = `You are a result formatter for NP AI Assistant. Format the following tool result in a user-friendly way.
+
+**Current Context:**
+- Current Date/Time (UTC): ${currentDateTime}
+- Current Local Time: ${currentLocalTime}
+- Timezone: ${timezone}
+- Day of Week: ${weekday}
 
 Original User Query: "${originalQuery}"
 Tool Used: ${toolName}
@@ -316,10 +316,15 @@ Instructions:
 2. If it's a JSON list/array of objects, format it as a readable table or list
 3. Use appropriate emojis and markdown formatting (tables, bullet points, etc.)
 4. For email/calendar/file operations, present the information clearly
-5. Convert technical data to user-friendly language
-6. If the result contains error information, present it clearly
-7. Keep the response well-structured and easy to scan
-8. Don't include raw JSON - make it human-readable
+5. **IMPORTANT - Time Context Usage:**
+   - Use the current context to make dates/times more readable and relevant
+   - Show relative times: "Today at 2:00 PM", "Tomorrow morning", "Next week"
+   - For calendar events, indicate if they're "upcoming", "today", "past", etc.
+   - Convert UTC times to local time when displaying to users
+6. Convert technical data to user-friendly language
+7. If the result contains error information, present it clearly
+8. Keep the response well-structured and easy to scan
+9. Don't include raw JSON - make it human-readable
 
 Format the result:`;
 
@@ -356,8 +361,12 @@ function extractUserQuery(text, context) {
  */
 async function queryOllama(prompt) {
   const ollamaUrl = (process.env.OLLAMA_URL || 'http://localhost:11434') + '/api/generate';
+  // Prioritize Azure environment variables over local .env files
   const model = process.env.OLLAMA_MODEL || 'gemma2:2b';
   const startTime = Date.now();
+  
+  console.log(`Using Ollama model: ${model} (from ${process.env.OLLAMA_MODEL ? 'environment' : 'default'})`);
+  console.log(`Environment check - OLLAMA_MODEL: '${process.env.OLLAMA_MODEL}', OLLAMA_URL: '${process.env.OLLAMA_URL}'`);
   
   try {
     // Prepare headers
