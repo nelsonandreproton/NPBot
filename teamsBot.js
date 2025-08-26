@@ -418,7 +418,7 @@ async function queryOllama(prompt) {
   console.log(`LLM Response Time: ${responseTime}ms (Model: ${model})`);
   
   // Add response time message to the result
-  const responseTimeMessage = `\n\n*Response time: ${responseTime}ms*`;
+  const responseTimeMessage = `\n\n*Response time: ${responseTime}ms with ${model}*`;
   
   // Optionally process any remaining buffer data
   return (resultText || "No response from LLM.") + responseTimeMessage;
