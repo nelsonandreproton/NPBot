@@ -352,10 +352,12 @@ function extractUserQuery(text, context) {
 }
 
 /**
- * Helper: Query Ollama's Gemma2:2B model
+ * Helper: Query Ollama LLM with response time tracking
  */
 async function queryOllama(prompt) {
   const ollamaUrl = (process.env.OLLAMA_URL || 'http://localhost:11434') + '/api/generate';
+  const model = process.env.OLLAMA_MODEL || 'gemma2:2b';
+  const startTime = Date.now();
   
   try {
     // Prepare headers
@@ -371,7 +373,7 @@ async function queryOllama(prompt) {
       method: 'POST',
       headers: headers,
       body: JSON.stringify({
-        model: 'gemma2:2b', // Adjust model name to match your Ollama config
+        model: model,
         prompt: prompt
       })
     });
@@ -410,11 +412,21 @@ async function queryOllama(prompt) {
     }
     done = readerDone;
   }
+  // Calculate response time and log it
+  const endTime = Date.now();
+  const responseTime = endTime - startTime;
+  console.log(`LLM Response Time: ${responseTime}ms (Model: ${model})`);
+  
+  // Add response time message to the result
+  const responseTimeMessage = `\n\n*Response time: ${responseTime}ms*`;
+  
   // Optionally process any remaining buffer data
-  return resultText || "No response from LLM.";
+  return (resultText || "No response from LLM.") + responseTimeMessage;
   
   } catch (error) {
-    console.error('Ollama query error:', error);
+    const endTime = Date.now();
+    const responseTime = endTime - startTime;
+    console.error(`Ollama query error after ${responseTime}ms:`, error);
     if (error.message.includes('HTML')) {
       return "Ollama service unavailable. Please check that Ollama is running and accessible.";
     }
